@@ -1,0 +1,1709 @@
+---
+title: "R code for Seasonal stoichiometry of terrestrial consumer-resource interactions"
+output:
+  word_document:
+    reference_docx: draft_styles.docx
+date: "2025-06-11"
+---
+
+```{r packages, message = FALSE, warning = FALSE}
+library(pacman)
+
+p_load(brms, tidyverse, tidybayes, viridis, bayesplot, scales, 
+       marginaleffects, ggh4x, patchwork, ggpubr, performance, 
+       broom.mixed, ggdist, vegan, otuSummary, cmdstanr, styler)
+
+rhat<-brms::rhat
+register_knitr_engine(override = TRUE)
+knitr::opts_chunk$set(tidy = "styler")
+
+```
+
+Import trap locations
+
+```{r locations, message = FALSE, warning = FALSE}
+trap_coords <- read_csv("Sampling_locations.csv") %>%
+  group_by(site_location, sampling_point) %>%
+  summarize(Longitude = mean(Long), Latitude = mean(Lat) ) %>%
+  arrange(sampling_point) %>%
+  rename(Site = site_location, Trap = sampling_point) %>%
+  mutate(Site = case_when(Site == "Carden PP" ~ "Carden Alvar Prov Park",
+                          Site == "North Bear" ~ "North Bear NCC",
+                          Site == "Prairie Smoke" ~ "Prairie Smoke NCC"))
+
+```
+
+Import ratio data
+
+```{r importData-ratio, message = FALSE, warning = FALSE}
+ratios <- read_csv("ewpw_ratios_complete.csv") %>%
+  rename(Trap = "Trap Location", Type = "Leaf Type", Date = "Sample Date",
+         N = "%N", C = "%C", Ratio = "C/N  ratio (by mol)") %>%
+  select(-c(10:12))
+
+ratios_2 <- ratios %>% 
+  filter(!Well%in%c("NO MOTHS"), !Date%in%c("unknown", "Incorrect date")) %>%
+  mutate(Week = as.numeric(Week)) %>%
+  mutate(Date = as.Date(Date, format = "%d-%b"),
+         Site = str_sub(Trap, 1, 2),
+         Week_2 = rescale(Week)) %>%
+  filter(Trap!="NB4") %>%
+  mutate(N = N/100, C = C/100)
+
+raw_data <- ratios_2 %>%
+  ggplot(aes(x = Date, y = Ratio)) + 
+  geom_point(aes(color = Trap)) +
+  facet_grid(Type~.) + 
+  theme_classic()
+
+ratios_3 <- ratios_2 %>%
+  pivot_longer(c("N", "C", "Ratio"), names_to = "Component", 
+               values_to = "Ratio")
+
+```
+
+Import light data
+
+```{r importData-light, message = FALSE, warning = FALSE}
+
+light <- read_csv("light_data.csv") %>%
+  mutate(Date = strptime(Date, format = "%m/%d/%Y %H:%M", tz = "")) %>%
+  mutate(Time = format(as.POSIXct(Date), format = "%H:%M")) %>%
+  mutate(light_hours = as.duration(hm(Time))) %>%
+  mutate(light_hours = as.numeric(light_hours/3600)) %>%
+  mutate(ppfd_edge = DLI_Edge/(0.0036*light_hours),
+         ppfd_alvar = DLI_Alvar/(0.0036*light_hours))
+
+light_sites <- light %>%
+  group_by(Trap) %>%
+  summarize(ppfd_edge = mean(ppfd_edge, na.rm = TRUE),
+            ppfd_alvar = mean(ppfd_alvar, na.rm = TRUE))
+
+light_ratios <- left_join(ratios_3, light_sites, by = "Trap") %>%
+  filter(Type != "moth") %>%
+  mutate(ppfd = ifelse(Type == "alvar", ppfd_alvar, ppfd_edge)) %>%
+  select(-Well, -Weight, -ppfd_edge, -ppfd_alvar)
+
+```
+
+Import and merge with plant genus data
+
+```{r mergeData, message = FALSE, warning = FALSE}
+
+species <- read_csv("distance_to_edge_species.csv") %>%
+  mutate(Type = str_to_lower(Type)) %>%
+  mutate(Genus = word(Species, 1))
+
+species %>% 
+  filter(Trap != "NB4") %>%
+  group_by(Type) %>%
+  summarize(mean = mean(Distance_edge), sd = sd(Distance_edge))
+
+species %>% 
+  filter(Trap != "NB4", Type == "moth") %>%
+  group_by(Type) %>%
+  summarize(mean = mean(Distance_between), sd = sd(Distance_between))
+
+light_all <- light_ratios %>%
+  ungroup() %>%
+  left_join(., species, by = c("Trap", "Type")) %>%
+  mutate(Genus_gp = ifelse(Genus %in% c("Ulmus", "Spiraea", "Salix", "Acer"), 
+                           "Other", Genus)) %>%
+  mutate(Week_fct = factor(Week_2),
+         Trap_hab = paste(Trap, Type, sep = "_"))
+  
+
+```
+
+Import leaf sampling dates
+
+```{r importDates-Leaves, message = FALSE, warning = FALSE}
+leaves <- read_csv("leaf_sample_dates.csv") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) %>%
+  select(Date, SP, Type, Genus, Species, Common_name) %>%
+  mutate(Species = ifelse(is.na(Species), "sp.", Species)) %>%
+  mutate(Scientific_name = paste(Genus, Species, sep=" ")) %>%
+  mutate(Site = case_when(grepl("PS", SP) ~ "Prairie Smoke NCC",
+                          grepl("NB", SP) ~ "North Bear NCC",
+                          grepl("CP", SP) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Sample = ifelse(grepl("F", Type), "Fixed", "Random")) %>%
+  mutate(Location = case_when(Type == "AF" ~ "Alvar",
+                              Type == "EF" ~ "Forest edge",
+                              Type == "RANDOM" ~ "Forest edge",
+                              grepl("CAT", Type) ~ "Caterpillar plant")) 
+
+leaves %>% 
+  filter(Type == "EF") %>%
+  arrange(SP, Date) %>%
+  group_by(SP) %>%
+  mutate(Diff = Date - lag(Date)) %>%
+  filter(!is.na(Diff),
+         Diff > 0) %>%
+  #slice_min(Diff) %>%
+  select(SP, Diff) %>%
+  ungroup() %>%
+  summarize(mean = mean(Diff), sd = sd(Diff))
+
+
+```
+
+Import moth trapping dates
+
+```{r importDates-Moths, message = FALSE, warning = FALSE}
+trap_dates <- read_csv("moth_trap_dates.csv") %>%
+  select("Date and time", "Sampling point", "How many moths?") %>%
+  rename(Date = "Date and time", Point = "Sampling point", 
+         Moths_sampled = "How many moths?") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) %>%
+  mutate(Site = case_when(grepl("PS", Point) ~ "Prairie Smoke NCC",
+                          grepl("NB", Point) ~ "North Bear NCC",
+                          grepl("CP", Point) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Week = as.numeric(strftime(Date, format = "%V")))
+
+
+trap_dates %>% 
+  arrange(Point, Date) %>%
+  group_by(Point) %>%
+  mutate(Diff = Date - lag(Date)) %>%
+  filter(!is.na(Diff),
+         Diff > 0) %>%
+  #slice_min(Diff) %>%
+  select(Point, Diff) %>%
+  ungroup() %>%
+  summarize(mean = mean(Diff), sd = sd(Diff))
+
+```
+
+## ANALYZING ELEMENTAL COMPOSITION AND RATIOS THROUGH TIME AND WITH LIGHT LEVELS
+
+Help inform priors
+
+```{r priors, message = FALSE, warning = FALSE}
+group_ratios <- 1
+group_ratios_sd <- 0.75
+
+gamma_mu_ratios    <- log(group_ratios / sqrt(group_ratios_sd ^2 / group_ratios^2 + 1))
+gamma_sigma_ratios <- sqrt(log(group_ratios_sd ^2 / group_ratios^2 + 1))
+
+gamma_mu_slope <- 0
+gamma_sigma_slope <- 0.25
+
+beta_mu_percents <- 0
+beta_sigma_percents <- 1
+
+beta_mu_slope <- 0
+beta_sigma_slope <- 1
+
+```
+
+Set-up analyses
+
+```{r analysisRatios, message = FALSE, warning = FALSE}
+all_analyses <- bind_rows(
+  ratios_3 %>%
+    mutate(Analysis = "Week"),
+  light_all %>%
+    mutate(Analysis = "Light")) %>%
+  group_by(Analysis, Component) %>%
+  nest() %>%
+  mutate(Model = case_when(Analysis == "Week" ~ 
+                             list(bf(Ratio ~ 0 + Type + Type:Week_2 + 
+                                       ((0 + Type + Type:Week_2 )|Trap))),
+                           
+                           Analysis == "Light" ~ 
+                             list(bf(Ratio ~ Genus_gp + ppfd + 
+                                       (1|Week_fct) + (1|Trap)))),
+         
+         Family = case_when(Component == "Ratio" ~ list(Gamma(link="log")),
+                            Component != "Ratio" ~ list(Beta())),
+         
+         Priors = case_when(
+           Analysis == "Week"&Component == "Ratio" ~ list(c(
+             prior(normal(-0.223, 0.668), class = b, coef = Typealvar),
+             prior(normal(-0.223, 0.668), class = b, coef = Typeedge),
+             prior(normal(-0.223, 0.668), class = b, coef = Typemoth),
+             prior(normal(0, 0.25), class = b, coef = Typealvar:Week_2),
+             prior(normal(0, 0.25), class = b, coef = Typeedge:Week_2),
+             prior(normal(0, 0.25), class = b, coef = Typemoth:Week_2),
+             prior(exponential(1), class = sd),
+             prior(lkj(2), class = cor))),
+         
+         Analysis == "Week"&Component!="Ratio" ~ list(c(
+             prior(normal(0, 1),  class = b),
+             prior(gamma(4, 0.1), class = phi),
+             prior(exponential(1), class = sd),
+             prior(lkj(2), class = cor))),
+         
+         Analysis == "Light"&Component == "Ratio" ~ list(c(
+             prior(normal(-0.223, 0.668), class = Intercept),
+             prior(normal(-0.223, 0.668), class = b, coef = Genus_gpLonicera),
+             prior(normal(-0.223, 0.668), class = b, coef = Genus_gpPopulus), 
+             prior(normal(-0.223, 0.668), class = b, coef = Genus_gpPrunus),
+             prior(normal(-0.223, 0.668), class = b, coef = Genus_gpOther),
+             prior(normal(0, 0.25), class = b, coef = ppfd),
+             prior(exponential(1), class = sd))),
+         
+         Analysis == "Light"&Component!="Ratio" ~ list(c(
+            prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = b),
+            prior(gamma(4, 0.1), class = phi),
+            prior(exponential(1), class = sd)))))
+           
+           
+```
+
+Prior predictive checks
+
+```{r priorchecksRatios, message = FALSE, warning = FALSE}
+all_priors <- all_analyses %>%
+  mutate(Prior_sampling = pmap(list(Model, data, Family, Priors, Component, 
+                                    Analysis), 
+                               function(first, second, third, fourth, fifth, 
+                                        sixth) 
+                                 brm(formula = first,
+                                     data = second,
+                                     family = third,
+                                     prior = fourth,
+                                     init = 0,
+                                     sample_prior = "only",
+                                     iter = 2000,
+                                     warmup = 1000, 
+                                     chains = 4, 
+                                     cores = 4,
+                                     control = list(adapt_delta = 0.99, 
+                                                    max_treedepth = 15),
+                                     file = paste("Prior", fifth, sixth, 
+                                                  sep = "_"),
+                                     backend = "cmdstanr")))
+
+all_priors <- all_priors %>%
+  mutate(prior_checks = map2(Prior_sampling, Analysis, function(first, second) 
+    if(second == "Week"){pp_check(first, type = "stat_grouped",
+                                  group = "Type", prefix = "ppd")}else{
+                                    
+                         pp_check(first, type = "stat_grouped",
+                                  group = "Genus_gp", prefix = "ppd")}))
+
+pwalk(list(all_priors$prior_checks, all_priors$Component, all_priors$Analysis), 
+      function(first, second, third)
+        ggsave(paste("Prior_check", second, third, "png", sep = "."), 
+         first, 
+         "png",
+         width = 9,
+         height = 7,
+         units = "in"))
+
+```
+
+Model posteriors
+
+```{r returnPosteriors-Ratios, message = FALSE, warning = FALSE}
+all_posteriors <- all_analyses %>%
+  mutate(Posterior_sampling = pmap(list(Model, data, Family, Priors, Component, 
+                                        Analysis), 
+                               function(first, second, third, fourth, fifth, 
+                                        sixth) 
+                                 brm(formula = first,
+                                     data = second,
+                                     family = third,
+                                     prior = fourth,
+                                     init = 0,
+                                     iter = 8000, 
+                                     warmup = 4000, 
+                                     chains = 4, 
+                                     cores = 4,
+                                     control = list(adapt_delta = 0.99, 
+                                                    max_treedepth = 15),
+                                     file = paste("Posterior", fifth, sixth, 
+                                                  sep = "_"),
+                                     backend = "cmdstanr")))
+```
+
+Diagnostics
+
+```{r modelDiagnostics-Ratios, message = FALSE, warning = FALSE}
+
+all_posteriors <- all_posteriors %>%
+  mutate(posteriors_checks = map2(Posterior_sampling, Analysis, 
+                                  function(first, second) 
+    if(second == "Week"){pp_check(first, type = "stat_grouped",
+                                  group = "Type", prefix = "ppc")}else{
+                                    
+                         pp_check(first, type = "stat_grouped",
+                                  group = "Genus_gp", prefix = "ppc")}))
+
+pwalk(list(all_posteriors$posteriors_checks, all_posteriors$Component, 
+           all_posteriors$Analysis), 
+      function(first, second, third)
+        ggsave(paste("Posterior_check", second, third, "png", sep = "."), 
+         first, 
+         "png",
+         width = 9,
+         height = 7,
+         units = "in"))
+
+rhats <- all_posteriors %>% 
+  mutate(r_hat = map(Posterior_sampling, ~as.data.frame(rhat(.x))))
+```
+
+Function: Get slopes for elemental composition and ratios averaged across weeks, light, genus, and traps
+- Table 1 and Table 2
+
+```{r function-getSlopes-ratios, message = FALSE, warning = FALSE}
+
+get_slopes <- function(x, y){
+  
+  if(x == "Light"){
+    the_slope <- avg_slopes(y, 
+                            variables = "ppfd", 
+                            newdata = datagrid(Genus_gp = unique, 
+                                               Trap = unique),
+                            by = TRUE) %>%
+      posterior_draws()}else{
+    
+    the_slope <- avg_slopes(y, 
+                            variables = "Week_2", 
+                            newdata = datagrid(Type = unique, 
+                                               Trap = unique),
+                            by = "Type") %>%
+      posterior_draws()
+      }
+      }
+
+```
+
+Function: Get slopes for elemental composition and ratios averaged across weeks, light, and genus for each trap
+- Figure S1
+
+```{r function-getSlopesTraps-ratios, message = FALSE, warning = FALSE}
+
+get_slopes_traps <- function(x, y){
+  
+  if(x == "Light"){NULL}else{
+    the_slope <- slopes(y, 
+                        variables = "Week_2", 
+                        newdata = datagrid(Type = unique, Trap = unique, 
+                                           Week_2 = unique),
+                        by = c("Type", "Trap")) %>%
+      posterior_draws() 
+      }
+      }
+
+```
+
+Function: Get difference in elemental composition and ratios between the extreme ends of the week and light gradients (for light, assume one gradient even if the mins and maxes vary per genus) averaged across traps
+
+```{r function-getComparisons-ratios, message = FALSE, warning = FALSE}
+
+
+get_comparisons <- function(x, y){
+  
+  if(x == "Light"){
+    the_comparison <- avg_comparisons(y,
+                                      variables = list(ppfd = "minmax"), 
+                                      newdata = datagrid(Genus_gp = unique, 
+                                                         Trap = unique), 
+                                      by = TRUE) %>%
+      posterior_draws()}else{
+    
+    the_comparison <- avg_comparisons(y,
+                                      variables = list(Week_2 = "minmax"), 
+                                      newdata = datagrid(Type = unique, 
+                                                         Trap = unique), 
+                                      by = "Type") %>%
+      posterior_draws()
+      }
+      }
+
+```
+
+Function: Get difference in elemental composition and ratios between the extreme ends of the week and light gradients (for light, assume one gradient even if the mins and maxes vary per genus) for each trap
+
+```{r function-getComparisonsTraps-ratios, message = FALSE, warning = FALSE}
+
+get_comparisons_traps <- function(x, y){
+  
+  if(x == "Light"){NULL}else{
+    
+    the_comparison <- avg_comparisons(y,
+                                      variables = list(Week_2 = "minmax"), 
+                                      newdata = datagrid(Type = unique, 
+                                                         Trap = unique), 
+                                      by = FALSE) %>%
+      posterior_draws()
+      }
+      }
+
+```
+
+Function: Get elemental composition and ratios at the extreme ends of the week and light gradients (for light, assume one gradient even if the mins and maxes vary per genus) averaged across traps
+
+```{r function-getGradient-ratios, message = FALSE, warning = FALSE}
+
+get_gradient <- function(x, y){
+  
+  if(x == "Light"){
+    preds <- avg_predictions(y,
+                             newdata = datagrid(Genus_gp = unique,
+                                                Trap = unique,
+                                                ppfd = c(min(light_all$ppfd),
+                                                         max(light_all$ppfd))),
+                                            by = "ppfd") %>%
+    posterior_draws()}else{
+  
+  preds <- avg_predictions(y, 
+                           newdata = datagrid(Type = unique, 
+                                              Trap = unique, 
+                                              Week_2 = c(min(ratios_3$Week_2), 
+                                                         max(ratios_3$Week_2))), 
+                           by = c("Week_2", "Type")) %>%
+    posterior_draws() 
+  }
+  
+  }
+```
+
+Function: Get elemental composition and ratios at the extreme ends of the week and light gradients (for light, assume one gradient even if the mins and maxes vary per genus) for each trap
+
+```{r function-getGradientTraps-ratios, message = FALSE, warning = FALSE}
+
+get_gradient_traps <- function(x, y){
+  
+  if(x == "Light"){NULL}else{
+  
+  preds <- avg_predictions(y, 
+                           newdata = datagrid(Type = unique, 
+                                              Trap = unique, 
+                                              Week_2 = c(min(ratios_3$Week_2), 
+                                                         max(ratios_3$Week_2))), 
+                           by = FALSE) %>%
+    posterior_draws() 
+  }
+  
+  }
+```
+
+Function: Get elemental composition and ratios for each genus at mean ppfd values
+- Figure 3
+
+```{r function-compareGenus-ratios, message = FALSE, warning = FALSE}
+
+get_comparisons_genus <- function(x, y){
+  
+  if(x == "Week"){NULL}else{
+  
+  preds <-avg_predictions(y,
+                       newdata = datagrid(Genus_gp = unique,
+                                          ppfd = unique,
+                                          Trap = unique), 
+                       by = "Genus_gp") %>%
+      posterior_draws()
+  }
+  
+}
+```
+
+Function: Get elemental composition and ratios across week and light gradient averaged across genus and traps
+- Figure 2 and Figure 4
+
+```{r function-getPredictions-ratios, message = FALSE, warning = FALSE}
+
+get_predictions <- function(x, y){
+  
+  if(x == "Week"){
+    
+  predict_data <- ratios_3 %>%
+    group_by(Week, Week_2) %>%
+    slice_min(Date) %>%
+    select(Week, Week_2, Date) %>%
+    distinct() %>%
+    full_join(tibble(Week = seq(min(ratios_3$Week), max(ratios_3$Week), 1))) %>% 
+    ungroup() %>%
+    mutate(Week_2 = rescale(Week)) %>%
+    arrange(Week_2) %>%
+    mutate(Date = Date - 366) %>% 
+    mutate(Date = if_else(is.na(Date), lag(Date, n = 1) + 7, Date)) %>%
+    mutate(Date = if_else(is.na(Date), lag(Date, n = 2) + 14, Date)) %>%
+    expand(nesting(Week, Week_2, Date), 
+           Trap  = unique(ratios_3$Trap), 
+           Type = unique(ratios_3$Type)) 
+    
+    preds <- avg_predictions(y, 
+                             newdata = predict_data, 
+                             by = c("Week_2", "Type", "Date")) %>%
+      posterior_draws()
+  }else{
+    
+     preds <- avg_predictions(y, 
+                         
+                         newdata = datagrid(ppfd = seq(min(light_all$ppfd), 
+                                                       max(light_all$ppfd),
+                                           length.out = 100),
+                                           Genus_gp = unique,
+                                           Trap = unique),
+                         by = "ppfd") %>%
+      posterior_draws()
+  }
+  
+}
+```
+
+Function: Get variance in elemental composition and ratios and their slopes across traps
+
+```{r function-getVariance-ratios, message = FALSE, warning = FALSE}
+
+get_var <- function(x, y){
+  
+  if(x == "Week"){
+  
+  vars <-  bind_rows(
+    y %>%
+      tidy(effects = c("ran_pars"), conf.level = 0.95) %>%
+      mutate(.width = 0.95), 
+    y %>%
+      tidy(effects = c("ran_pars"), conf.level = 0.5) %>%
+                mutate(.width = 0.5)) %>%
+    filter(grepl("sd", term)) %>%
+    mutate(Term = ifelse(grepl("Week_2", term), "Slope", "Intercept")) %>%
+    mutate(Habitat = case_when(grepl("alvar", term) ~ "Alvar leaves",
+                               grepl("edge", term) ~ "Forest edge leaves",
+                               grepl("moth", term) ~ "Moths"))}else{
+                            
+  vars <- bind_rows(
+    y %>%
+      tidy(effects = c("ran_pars"), conf.level = 0.95) %>%
+      mutate(.width = 0.95), 
+    y %>%
+      tidy(effects = c("ran_pars"), conf.level = 0.5) %>%
+                mutate(.width = 0.5)) %>%
+      filter(grepl("sd", term)) %>%
+    mutate(Term = ifelse(grepl("ppfd", term), "Slope", "Intercept"))
+                                 
+                                 
+}
+}
+```
+
+Run functions
+
+```{r AllResults-ratios, message = FALSE, warning = FALSE}
+
+all_posteriors <- all_analyses %>%
+  mutate(Posterior_sampling = map2(Component, Analysis,
+                                   ~readRDS(paste0("Posterior_", Component, "_", 
+                                                   Analysis, ".rds")))) %>%
+  mutate(slopes = map2(Analysis, Posterior_sampling, get_slopes),
+         slopes_traps = map2(Analysis, Posterior_sampling, get_slopes_traps),
+         difference = map2(Analysis, Posterior_sampling, get_comparisons),
+         difference_traps = map2(Analysis, Posterior_sampling, 
+                                 get_comparisons_traps),
+         gradient = map2(Analysis, Posterior_sampling, get_gradient),
+         gradient = map2(Analysis, Posterior_sampling, get_gradient_traps),
+         genus = map2(Analysis, Posterior_sampling, get_comparisons_genus),
+         predictions = map2(Analysis, Posterior_sampling, get_predictions),
+         random_effects = map2(Analysis, Posterior_sampling, get_var)) %>%
+  ungroup() %>%
+  select(-Posterior_sampling)
+
+```
+
+Table 1: Elemental composition and ratio slopes for weeks averaged over random effects
+
+```{r table-slopesWeek-ratios, message = FALSE, warning = FALSE}
+slopes <- all_posteriors %>%
+  ungroup() %>%
+  unnest(slopes) %>%
+  group_by(Component, Analysis, term, Type) %>%
+  median_qi(draw, .width = c(0.5, 0.95))
+  
+```
+
+Figure S1: Slopes for elemental composition and ratios averaged across weeks for each trap
+
+```{r}
+
+slope_spatial <- all_posteriors %>% 
+  unnest(slopes_traps) %>%
+  ungroup() %>%
+  mutate(Habitat = case_when(Type == "alvar" ~ "Alvar leaves",
+                             Type == "edge" ~ "Forest edge leaves",
+                             Type == "moth" ~ "Moths")) %>%
+  mutate(Site = case_when(grepl("PS", Trap) ~ "Prairie Smoke NCC",
+                          grepl("NB", Trap) ~ "North Bear NCC",
+                          grepl("CP", Trap) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Trap_2 = substr(Trap, 3, 3)) %>%
+  mutate(draw = ifelse(Component == "Ratio", draw/22, (draw*100)/22)) %>%
+  group_by(Component, Habitat, Site, Trap_2) %>%
+  median_qi(draw, .width = c(0.5, 0.95)) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+  mutate(Component = factor(Component, levels = c("% C", "% N", "C:N"))) %>%
+  #filter(Component == "C:N") %>%
+  ggplot(aes(x = draw, y = Habitat, xmin = .lower, xmax = .upper, color = Habitat)) +
+  #ggplot(aes(x = draw, y = Habitat, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval(position = position_dodgejust(width = 0.25),  
+                     point_color = "burlywood4", point_size = 0.1) +
+  facet_nested(Site + Trap_2 ~ Component, nest_line = element_line(linetype = 2), 
+               scales = "free") +
+  facetted_pos_scales(x = list(Component == "%N" ~ scale_x_continuous(name = "\nWeekly change", 
+                                                  breaks = c(-0.6, -0.1, 0.3, 0.8), 
+                                                  limits = c(-0.6, 0.8)),
+                               Component == "%C" ~ scale_x_continuous(name ="\nWeekly change", 
+                                                  breaks = c(-0.2, -0.1, 0, 0.05), 
+                                                  limits = c(-0.2, 0.05)), 
+                               Component == "C:N" ~ scale_x_continuous(name ="\nWeekly change", 
+                                                  breaks = seq(-0.2, 4, length.out = 4),
+                                                  limits = c(-0.2, 4)))) +
+  scale_color_viridis("", discrete = TRUE) +
+  scale_x_continuous("\nWeekly change") +
+  scale_y_discrete("") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        ggh4x.facet.nestline = element_line(colour = "blue"),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave("Site_slopes.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+```
+
+
+Figure NA: Difference in elemental composition and ratios between start and end of season for each trap
+
+```{r figure-differences-ratios, message = FALSE, warning = FALSE}
+
+difference_traps <- all_posteriors %>% 
+  unnest(difference_traps) %>%
+  ungroup() %>%
+  mutate(Habitat = case_when(Type == "alvar" ~ "Alvar leaves",
+                             Type == "edge" ~ "Forest edge leaves",
+                             Type == "moth" ~ "Moths")) %>%
+  mutate(Site = case_when(grepl("PS", Trap) ~ "Prairie Smoke NCC",
+                          grepl("NB", Trap) ~ "North Bear NCC",
+                          grepl("CP", Trap) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Trap_2 = substr(Trap, 3, 3)) %>%
+  mutate(draw = ifelse(Component == "Ratio", draw, draw*100)) %>%
+  group_by(Component, Habitat, Site, Trap_2) %>%
+  median_qi(draw, .width = c(0.5, 0.95)) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+  mutate(Component = factor(Component, levels = c("% C", "% N", "C:N"))) %>%
+  ggplot(aes(x = draw, y = Habitat, xmin = .lower, xmax = .upper, color = Habitat)) +
+  #ggplot(aes(x = draw, y = Habitat, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval(position = position_dodgejust(width = 0.25),  
+                     point_color = "burlywood4", point_size = 0.1) +
+  facet_nested(Site + Trap_2 ~ Component, nest_line = element_line(linetype = 2), 
+               scales = "free") +
+  facetted_pos_scales(x = list(Component == "%N" ~ scale_x_continuous(name = "\nSeasonal difference", 
+                                                  breaks = c(-4, -2, 0, 2), 
+                                                  limits = c(-4, 2)),
+                               Component == "%C" ~ scale_x_continuous(name ="\nSeasonal difference", 
+                                                  breaks = c(-12.5, -6, 0, 6, 12.5), 
+                                                  limits = c(-12.5, 15.5)), 
+                               Component == "C:N" ~ scale_x_continuous(name ="\nSeasonal difference", 
+                                                  breaks = c(0, 45, 95, 145),
+                                                  limits = c(-4, 145)))) +
+  scale_color_viridis("", discrete = TRUE) +
+  scale_x_continuous("\nSeasonal difference") +
+  scale_y_discrete("") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        ggh4x.facet.nestline = element_line(colour = "blue"),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave("Site_seasonal.png", device="png", width = 7, height = 7, units = "in", 
+       dpi = 600)
+```
+
+Figure NA: Elemental composition and ratios at start and end of season averaged across traps
+
+```{r figure-gradient-ratios, message = FALSE, warning = FALSE}
+plot_change <- all_posteriors %>%
+  filter(Analysis == "Week") %>%
+  unnest(gradient) %>%
+  ungroup() %>%
+  mutate(Date = if_else(Week_2 == 0, "May 5", "October 7"),
+         Habitat = case_when(Type == "alvar" ~ "Alvar leaves",
+                            Type == "edge" ~ "Forest edge leaves",
+                            Type == "moth" ~ "Moths")) %>%
+  group_by(Component, Habitat, Date) %>%
+  mutate(draw = ifelse(Component == "Ratio", draw, draw*100)) %>%
+  median_qi(draw, .width = c(0.5, 0.95)) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+  mutate(Component = factor(Component, levels = c("% C", "% N", "C:N"))) %>%
+  ggplot(aes(x = draw, xmin = .lower, xmax = .upper, y = fct_rev(Habitat), 
+             color = fct_rev(Date))) +
+  geom_pointinterval(position = position_dodgejust(width = 0.25),  
+                     point_color = "burlywood4", point_size = 0.1) +
+  facet_grid(.~Component, scales = "free_x") +
+  facetted_pos_scales(x = list(scale_x_continuous("\nProportion or ratio", 
+                                                  breaks = seq(45, 60, 5), 
+                                                  limits = c(40, 65)),
+                               scale_x_continuous("\nProportion or ratio", 
+                                                  breaks = seq(0, 12, 2), 
+                                                  limits = c(0, 12)), 
+                               scale_x_continuous("\nProportion or ratio", 
+                                                  breaks = seq(0, 60, 10),
+                                                  limits = c(0, 60)))) +
+  scale_color_viridis("", direction = 1, discrete = TRUE) + 
+  scale_x_continuous("\nProportion or ratio") +
+  scale_y_discrete("") +
+  theme_classic() +
+  theme(strip.background = element_blank()) +
+  guides(color = guide_legend(reverse = T))
+
+ggsave("Seasonal_change.png", device="png", width = 7.5, height = 3.5, 
+       units = "in", dpi = 600)
+```
+
+Figure 2: Change in elemental composition and ratios over the season
+
+```{r figure-phenology-ratios, message = FALSE, warning = FALSE}
+
+phenology_plotting <- function(the_component, the_type, the_predictions){
+  
+  if(the_component == "Ratio"){ylabel = "C:N\n"}
+  if(the_component == "C"){ylabel = "% C\n"} 
+  if(the_component == "N"){ylabel = "% N\n"} 
+  
+
+phenology_plot <- the_predictions %>%
+  group_by(Date) %>%
+  median_qi(draw, .width = c(0.5, 0.95)) %>%
+  ggplot(aes(x = Date, y = draw, ymin = .lower, ymax = .upper)) +
+  geom_point(data = ratios_3 %>%
+               filter(Component == the_component, 
+                      Type == the_type) %>%
+               mutate(Date = Date - 366) %>%
+               rename(draw = Ratio) %>%
+               mutate(draw = ifelse(Component == "Ratio", draw, draw*100)) %>%
+               mutate(.lower = 0, .upper = 0), 
+             aes(x = Date, y = draw), 
+             colour = "darkseagreen4", size = 2) +
+  geom_lineribbon(alpha = 0.7, linewidth = 0.5) +
+  #scale_y_continuous(name = ylabel) +
+  scale_x_date("", date_breaks = "2 weeks", date_labels = "%b-%d") +
+  scale_fill_viridis(discrete = TRUE) +
+  theme_classic() 
+
+if(the_type == "moth"){
+  
+  phenology_plot <- phenology_plot + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+          legend.position = "none")}else{
+            
+  phenology_plot <- phenology_plot + 
+    theme(axis.text.x = element_blank(),
+          legend.position = "none")}
+
+if(the_type == "edge"){
+  phenology_plot <- phenology_plot + 
+    scale_y_continuous(name = paste0(ylabel, "forest edge leaves\n"))
+
+}else if(the_type == "alvar"){
+  phenology_plot <- phenology_plot + 
+    scale_y_continuous(name = paste0(ylabel, "alvar leaves\n"))
+
+}else{
+  phenology_plot <- phenology_plot + 
+    scale_y_continuous(name = paste0(ylabel, "moths\n"))
+}
+}
+
+all_phenology <- all_posteriors %>%
+  filter(Analysis == "Week") %>%
+  ungroup() %>%
+  select(Component, predictions) %>%
+  unnest(predictions) %>%
+  mutate(draw = ifelse(Component == "Ratio", draw, draw*100)) %>%
+  group_by(Component, Type) %>%
+  nest() %>%
+  mutate(phenology_plot = pmap(list(Component, Type, data), 
+                               phenology_plotting)) %>%
+  arrange(Type)
+
+
+ggarrange(plotlist = all_phenology$phenology_plot, ncol = 3, nrow = 3)
+
+ggsave("Phenology_plots.png", device="png", width = 9, height = 6.5, 
+       units = "in", dpi = 600)
+```
+
+Figure NA: variance in elemental composition and ratios and their slopes across traps
+
+```{r figure-variances-ratios, message = FALSE, warning = FALSE}
+
+variances <- all_posteriors %>% 
+  filter(Analysis == "Week") %>%
+  unnest(random_effects) %>%
+  mutate(Type = ifelse(Term == "Slope", "Change over time", 
+                       "At season mid-point")) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N Ratio",
+                               Component == "C" ~ "C content",
+                               Component == "N" ~ "N content")) %>%
+  mutate(Component = factor(Component, levels = c("C content", "N content",
+                                                  "C:N Ratio"))) %>%
+  ggplot(aes(x = estimate, y = fct_rev(Type), xmin = conf.low, 
+             xmax = conf.high, color = Habitat)) +
+  geom_pointinterval(position = position_dodgejust(width = 0.25),  
+                     point_color = "burlywood4", point_size = 0.1) +
+  facet_grid(.~Component) +
+  scale_color_viridis("", discrete = TRUE) +
+  scale_y_discrete("") +
+  scale_x_continuous("\nRandom effects variance", breaks = seq(0.2, 0.8, 0.2)) +
+  theme_classic() +
+  theme(strip.background = element_blank()) 
+
+ggsave("Variances.png", device="png", width = 7.5, height = 2.5, 
+       units = "in", dpi = 600)
+```
+
+Figure 3: Elemental composition and ratios for each genus
+
+```{r figure-genus-ratios, message = FALSE, warning = FALSE}
+
+compare_genus <- all_posteriors %>%
+  filter(Analysis == "Light") %>%
+  unnest(genus) %>%
+  mutate(draw = ifelse(Component!="Ratio", draw*100, draw)) %>%
+  ungroup() %>%
+  group_by(Component, Genus_gp) %>%
+  median_qi(draw, .width = c(0.5, 0.95))
+
+genus_plot <- compare_genus %>%
+  mutate(Genus_f = factor(Genus_gp, levels = c("Crataegus", 
+                                               "Lonicera", 
+                                               "Populus", 
+                                               "Prunus", 
+                                               "Other"))) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+  mutate(Component = factor(Component, levels = c("% C", "% N", "C:N"))) %>%
+  ggplot(aes(y = fct_rev(Genus_f), x = draw, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval(position = position_dodgejust(width = 0.25),  
+                     point_color = "burlywood4", point_size = 0.1, 
+                     color = "#440154") +
+  facet_grid(.~ Component, scales = "free") +
+  scale_y_discrete("") +
+  scale_x_continuous("\nPercent or ratio") +
+  
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1)) 
+
+ggsave("Compare_genus.png", device="png", width = 7.5, height = 3.5, 
+       units = "in", dpi = 600)
+```
+
+Table 2: Elemental composition and ratios slopes along light gradient
+
+```{r table-slopesLight-ratios, message = FALSE, warning = FALSE}  
+slope_light <- all_posteriors %>% 
+  filter(Analysis == "Light") %>%
+  ungroup() %>%
+  select(Component, slopes)
+  unnest(slopes) %>%
+  ungroup() %>%
+  mutate(draw = ifelse(Component!="Ratio", draw*100, draw)) %>%
+  group_by(Component) %>%
+  median_qi(draw, .width = c(0.5, 0.95))
+```
+
+Figure 4: Change in elemental composition and ratios along light gradient
+
+```{r figure-light-ratios, message = FALSE, warning = FALSE}  
+light_plotting <- all_posteriors %>% 
+  filter(Analysis == "Light") %>%
+  unnest(predictions) %>%
+  ungroup() %>%
+  mutate(draw = ifelse(Component!="Ratio", draw*100, draw)) %>%
+  group_by(Component, ppfd) %>%
+  median_qi(draw, .width = c(0.5, 0.95)) %>%
+  mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+  mutate(Component = factor(Component, levels = c("% C", "% N", "C:N"))) %>%
+  ggplot(aes(x = ppfd, y = draw, ymin = .lower, ymax = .upper)) +
+  geom_point(data = light_all %>%
+               ungroup() %>%
+               mutate(draw = ifelse(Component!="Ratio", Ratio*100, Ratio),
+                      Genus_f = factor(Genus_gp, levels = c("Crataegus", "Lonicera", 
+                                                "Populus", "Prunus", 
+                                                "Other"))) %>%
+               mutate(.lower = 0, .upper = 0) %>%
+               mutate(Component = case_when(Component == "Ratio" ~ "C:N",
+                               Component == "C" ~ "% C",
+                               Component == "N" ~ "% N")) %>%
+               mutate(Component = factor(Component, 
+                                         levels = c("% C", 
+                                                    "% N", "C:N"))) , 
+             aes(x = ppfd, y = draw), 
+             colour = "darkseagreen4", size = 2) +
+  geom_lineribbon(alpha = 0.7, linewidth = 0.5) +
+  facet_grid(Component ~ ., scales = "free",
+             switch = "y"
+             ) +
+  scale_y_continuous("") +
+  scale_x_continuous("\nPhotosynthetic photon flux density") +
+  scale_fill_viridis("", discrete = T) +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.placement = "outside",
+        #strip.text = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1)) 
+
+ggsave("Light_trends.png", device="png", width = 7.5, height = 3.5, 
+       units = "in", dpi = 600)
+```
+
+MOTH COMPOSITION ANALYSIS
+
+Import moth composition data
+
+```{r importData-moths, message = FALSE, warning = FALSE} 
+
+moth_raw <- read_csv("moth_identificationLN.csv") %>%
+  select(Date, SP, FAMILY, SUBFAMILY, TRIBE, GENUS, SPECIES, "COUNT_#") %>%
+  rename(Point = SP, Family = FAMILY, Subfamily = SUBFAMILY, 
+         Tribe = TRIBE, Genus = GENUS, Species = SPECIES, Count = "COUNT_#") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) 
+
+unknown_genus <- moth_raw %>% 
+  mutate(Gen2 = ifelse(is.na(Genus), "Bad", "Good")) %>% 
+  group_by(Date, Gen2) %>% summarize(Count = n()) %>%
+  pivot_wider(id_cols = Date, names_from = "Gen2", values_from = "Count") %>%
+  mutate(Ppn = Bad/(Good+Bad)) %>%
+  mutate(PPn = ifelse(is.na(Bad), 0, Ppn)) %>%
+  arrange(desc(Ppn))
+
+unknown_family <- moth_raw %>% 
+  mutate(Fam2 = ifelse(is.na(Family), "Bad", "Good")) %>% 
+  group_by(Date, Fam2) %>% summarize(Count = n()) %>%
+  pivot_wider(id_cols = Date, names_from = "Fam2", values_from = "Count") %>%
+  mutate(Ppn = Bad/(Good+Bad)) %>%
+  mutate(Ppn = ifelse(is.na(Bad), 0, Ppn)) %>%
+  arrange(desc(Ppn))
+ 
+missing_dates <- full_join(trap_dates, 
+                           moth_raw %>%
+                             select(Date, Point) %>%
+                             distinct() %>%
+                             mutate(Identified = "Y")) 
+
+## Set-up data for genus totals
+  
+moth_genus <- moth_raw %>%
+  left_join(., trap_dates %>%
+              select(Point, Date, Week) %>%
+              distinct()) %>%
+  filter(Point != "NB4") %>%
+  select(-Date) %>%
+  group_by(Genus, Week, Point) %>%
+  summarize(Count = sum(Count)) %>%
+  ungroup() %>%
+  mutate(Week_2 = rescale(Week)) %>%
+  filter(!is.na(Genus))
+
+moth_genus_2 <- moth_genus %>% 
+  filter(!is.na(Week)) %>%
+  select(Genus, Week, Point, Count) %>%
+  pivot_wider(#id_cols = c(Point, Week), 
+              names_from = Genus, 
+              values_from = Count, 
+              values_fill = 0) %>%
+  arrange(Point, Week)
+
+
+ ## Set-up data for family totals
+  
+moth_family <- moth_raw %>%
+  left_join(., trap_dates %>%
+              select(Point, Date, Week) %>%
+              distinct()) %>%
+  filter(Point != "NB4") %>%
+  select(-Date) %>%
+  group_by(Family, Week, Point) %>%
+  summarize(Count = sum(Count)) %>%
+  ungroup() %>%
+  #complete(Family, nesting(Week, Point), fill = list(Count = 0)) %>%
+  mutate(Week_2 = rescale(Week)) %>%
+  filter(!is.na(Family)) 
+
+moth_family_2 <- moth_family %>% 
+  select(Family, Week, Point, Count) %>%
+  pivot_wider(#id_cols = c(Point, Week), 
+              names_from = Family, 
+              values_from = Count, 
+              values_fill = 0) %>%
+  arrange(Point, Week)
+```
+
+Function: Calculate number of shared species as a proportion of total, between each pair of weeks
+
+```{r caculateJaccard, message = FALSE, warning = FALSE} 
+
+get_jaccard <- function(x){
+  
+  modified_x <- x %>%
+    column_to_rownames("Week")
+  
+  jaccard <- bind_cols(matrixConvert(designdist(modified_x, method = "J", terms = "binary")),
+                    matrixConvert(designdist(modified_x, method = "A+B", terms = "binary")) %>%
+                      rename(Total = dist) %>%
+                      select(Total)) 
+}
+```
+
+Model of shared species changing over time with point as a random effect
+A common smoother with each week's smoother varying in shape but with the same amount of wiggliness
+
+shared species ~ binom(total species, p)
+p = f(week) + f_week(Week)
+
+With 8-17 weeks, maximum wigliness (k) should be about 5
+
+```{r modelJaccard, message = FALSE, warning = FALSE} 
+jaccard_model <- bf(dist|trials(Total) ~ (1|sp1) + (1|sp2) + s(Time, k =5) + s(Time, Point, k = 5, bs = "fs"))
+```
+
+Sample priors
+
+```{r priorsJaccard, message = FALSE, warning = FALSE} 
+
+jaccard_prior <- function(x, y){
+  
+  jaccard_model_prior <- brm(jaccard_model,
+                          data = x,
+                          family = binomial(link = "logit"),
+                          prior = c(prior(normal(0, 3), class = Intercept), 
+                                    #corresponds to 95% of the distribution falling b/w p = 0 and p = 1
+                                    prior(normal(0, 10), class = b), 
+                                    #corresponds to 95% of the distribution falling between an odds of 0 and 7
+                                    prior(exponential(1), class = sd, lb = 0),
+                                    prior(normal(0, 10), class = sds, lb = 0)),
+                          sample_prior = "only",
+                          file = paste("jaccard", y, "prior", sep = "_"),
+                          backend = "cmdstanr")
+}
+```
+
+Sample posterior
+
+```{r posteriorJaccard, message = FALSE, warning = FALSE} 
+
+jaccard_posterior <- function(x, y){
+  
+  jaccard_model_posterior <- brm(jaccard_model,
+                              data = x,
+                              family = binomial(link = "logit"),
+                              prior = c(prior(normal(0, 3), class = Intercept), 
+                                        #corresponds to 95% of the distribution falling b/w p = 0 and p = 1
+                              prior(normal(0, 10), class = b), 
+                              #corresponds to 95% of the distribution falling between an odds of 0 and 7
+                              prior(exponential(1), class = sd, lb = 0),
+                              prior(normal(0, 10), class = sds, lb = 0)),
+                              iter = 4000,
+                              warmup = 2000,
+                              chains = 4,
+                              cores = 4,
+                              control = list(adapt_delta = 0.99, max_treedepth = 15),
+                              file = paste("jaccard", y, "posterior", sep = "_"),
+                              backend = "cmdstanr")
+}  
+```  
+
+Run models
+
+```{r runModels-Jaccard, message = FALSE, warning = FALSE} 
+
+moth_family_jaccard <- moth_family_2 %>%
+  group_by(Point) %>%
+  nest() %>%
+  mutate(jaccard_data = map(data, get_jaccard)) %>%
+  unnest(jaccard_data) %>%
+  ungroup() %>%
+  mutate(Time = sp2 - sp1) %>%
+  mutate(sp1 = paste(Point, sp1, sep = "_"),
+         sp2 = paste(Point, sp2, sep = "_")) %>%
+  filter(Total != 0) %>%
+  mutate(Type = "Family")
+
+moth_family_prior <- jaccard_prior(moth_family_jaccard, "Family")
+
+moth_family_posterior <- jaccard_posterior(moth_family_jaccard, "Family")
+
+moth_genus_jaccard <- moth_genus_2 %>%
+  group_by(Point) %>%
+  nest() %>%
+  mutate(jaccard_data = map(data, get_jaccard)) %>%
+  unnest(jaccard_data) %>%
+  ungroup() %>%
+  mutate(Time = sp2 - sp1) %>%
+  mutate(sp1 = paste(Point, sp1, sep = "_"),
+         sp2 = paste(Point, sp2, sep = "_"))  %>%
+  filter(Total != 0) %>%
+  mutate(Type = "Genus")
+
+moth_genus_prior <- jaccard_prior(moth_genus_jaccard, "Genus")
+
+moth_genus_posterior <- jaccard_posterior(moth_genus_jaccard, "Genus")
+  
+moth_jaccard_all <- bind_rows(moth_family_2 %>%
+                             mutate(Type = "Family") %>%
+                             group_by(Type) %>%
+                             nest(), 
+                           moth_genus_2 %>%
+                             mutate(Type = "Genus") %>%
+                             group_by(Type) %>%
+                             nest()) %>%
+  mutate(jaccard_priors= map(Type, ~readRDS(paste0("jaccard_", Type, "_prior", ".rds"))),
+         jaccard_posteriors= map(Type, ~readRDS(paste0("jaccard_", Type, "_posterior", ".rds"))))
+
+```
+
+Diagnostics
+
+```{r diagnostics-Jaccard, message = FALSE, warning = FALSE} 
+jaccard_diagnostics <- moth_jaccard_all %>%
+  mutate(Prior_all = map(jaccard_priors, ~pp_check(.x, ndraws = 100, prefix = "ppd")),
+         Prior_mean = map(jaccard_priors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "mean")),
+         Prior_max = map(jaccard_priors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "max")),
+         Prior_min = map(jaccard_priors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "min")),
+         Posterior_all = map(jaccard_posteriors, ~pp_check(.x, ndraws = 100)),
+         Posterior_mean = map(jaccard_posteriors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "mean")),
+         Posterior_max = map(jaccard_posteriors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "max")),
+         Posterior_min = map(jaccard_posteriors, ~pp_check(.x, ndraws = 100, type = "stat", stat = "min"))
+         )
+
+jaccard_diagnostics_2 <- jaccard_diagnostics %>% 
+  select(-data, -jaccard_priors, -jaccard_posteriors) %>%
+  pivot_longer(-Type, names_to = "Model", values_to = "ggs")
+
+pwalk(list(jaccard_diagnostics_2$Type, 
+      jaccard_diagnostics_2$Model,
+      jaccard_diagnostics_2$ggs),
+      function(first, second, third){
+        ggsave(paste0(second, "_", first, ".png"), 
+        third, 
+         "png",
+         width = 9,
+         height = 7,
+         units = "in")})
+  
+```
+
+Function: Slope of the Jaccard index averaged across distances and traps
+
+```{r functionSlopes-Jaccard, message = FALSE, warning = FALSE}
+
+jaccard_slope<- function(x, y){
+  
+  if(y == "Family"){community_total <- 21}else{community_total <- 55}
+  
+  get_predict <- avg_slopes(x, variable = "Time", newdata = datagrid(model = x, Time = 1:22, 
+                                                       Total = community_total, 
+                                                       grid_type = "counterfactual")) %>%
+    posterior_draws() %>%
+    mutate(jaccard = draw/community_total) %>%
+    median_qi(jaccard, .width = c(0.5, 0.95))
+}
+```
+
+Function: Jaccard index for each pair of weeks at each trap
+- Figure S3 and Figure S4
+
+```{r functionPredict-Jaccard-traps, message = FALSE, warning = FALSE}
+
+jaccard_weeks<- function(x, y){
+  
+  if(y == "Family"){community_total <- 21}else{community_total <- 55}
+  
+  get_predict <- avg_predictions(x, newdata = datagrid(model = x, Time = 1:22, 
+                                                       Total = community_total, 
+                                                       grid_type = "counterfactual"),
+                                 by = c("Point", "Time")) %>%
+    posterior_draws() 
+}
+```
+
+Function: Jaccard index for each pair of weeks averaged across traps
+- Figure 5 and Figure S2
+
+```{r functionPredict-Jaccard, message = FALSE, warning = FALSE}
+jaccard_weeks_average <- function(x, y){
+
+  if(y == "Family"){community_total <- 21}else{community_total <- 55}
+  
+  get_predict <- avg_predictions(x, newdata = datagrid(model = x,  
+                                                       Total = community_total, 
+                                                       grid_type = "counterfactual"), 
+                                 by = "Time") %>%
+    posterior_draws() 
+}
+```
+
+Function: Jaccard index between two points in time separated by 1 week at different weeks during the season and averaged across traps
+- Figure S5 and Figure S6
+
+```{r functionPredict-Jaccard-week, message = FALSE, warning = FALSE}
+
+jaccard_dates <- function(x, y){
+  
+  if(y == "Family"){community_total <- 21}else{community_total <- 55}
+  
+  get_predict <- avg_predictions(x,  
+                  newdata = datagrid(model = x, Time = 1,
+                                     Total = community_total,
+                                     grid_type = "counterfactual"), 
+                  by = c("Point", "sp1")) %>%
+  posterior_draws()
+}
+
+
+```         
+
+Function: Figure of Jaccard index for each pair of weeks at each trap
+- Figure S3 and Figure S4
+
+```{r figurePredict-Jaccard-traps, message = FALSE, warning = FALSE}                                 
+
+# Each point's Jaccard index for separation distances of 1, 4, and 8 weeks
+
+figure_weeks_point <- function(x, y){
+
+if(y == "Family"){community_total <- 21}else{community_total <- 55}
+
+jaccard_weeks_figure <- x %>%
+  mutate(jaccard = draw/community_total) %>%
+  group_by(Point, Time) %>%
+  median_qi(jaccard, .width = c(0.5, 0.95)) %>%
+  mutate(Site = case_when(grepl("PS", Point) ~ "Prairie Smoke NCC",
+                          grepl("NB", Point) ~ "North Bear NCC",
+                          grepl("CP", Point) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Trap = substr(Point, 3, 3)) %>%
+  filter(Time %in% c(1, 4, 8)) %>%
+  mutate(Time = case_when(Time == 1 ~ "One week",
+                          Time == 4 ~ "4 weeks",
+                          Time == 8 ~ "8 weeks")) %>%
+  mutate(Time = factor(Time, levels = c("One week", "4 weeks", "8 weeks"))) %>%
+  ggplot(aes(x = Time, y = jaccard, ymin = .lower, ymax = .upper, color = Time)) +
+  geom_pointinterval() +
+  facet_nested(. ~ Site + Trap, nest_line = element_line(linetype = 2),
+               scales = "free_x") +
+  scale_y_continuous("Jaccard index\n") +
+  scale_x_discrete("") +
+  scale_color_viridis("", discrete = TRUE) +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        strip.background = element_blank(),
+        ggh4x.facet.nestline = element_line(colour = "blue"),
+        legend.position = "bottom")
+}
+```
+
+Function: Figure of Jaccard index for each pair of weeks averaged across traps
+- Figure 5 and Figure S2
+
+```{r figurePredict-Jaccard, message = FALSE, warning = FALSE}
+#Jaccard index vs time averaged over all points
+
+figure_weeks_average <- function(x, y){
+
+if(y == "Family"){community_total <- 21}else{community_total <- 55}
+if(y == "Family"){community_data = moth_family_jaccard}else{community_data = moth_genus_jaccard}
+  
+jaccard_weeks_figure <- x %>%
+  mutate(jaccard = draw/community_total) %>%
+  group_by(Time) %>%
+  median_qi(jaccard, .width = c(0.5, 0.95)) %>%
+  ggplot(aes(x = Time, y = jaccard, ymin = .lower, ymax = .upper)) +
+  geom_point(data = community_data %>%
+               mutate(jaccard = dist/Total) %>%
+               mutate(.lower = 0, .upper = 0), 
+               aes(x = Time, y = jaccard#, color = Point
+                   ), colour = "darkseagreen4", size = 2) +
+  geom_lineribbon(alpha = 0.7, linewidth = 0.5) +
+  scale_y_continuous("Jaccard index\n") +
+  scale_x_continuous("\nDistance in weeks") +
+  scale_color_viridis("", discrete = TRUE) +
+  theme_classic() +
+  theme(legend.position = "none")
+}
+```
+
+
+Function: Jaccard index between two points in time separated by 1 week at different weeks during the season and averaged across traps
+- Figure S5 and Figure S6
+
+```{r figurePredict-Jaccard-week, message = FALSE, warning = FALSE}
+
+figure_dates_point <- function(x, y){
+
+if(y == "Family"){community_total <- 21}else{community_total <- 55}
+
+jaccard_dates_figure <- x  %>%
+  mutate(jaccard = draw/community_total) %>%
+  group_by(Point, sp1) %>%
+  median_qi(jaccard, .width = c(0.5, 0.95)) %>%
+  mutate(Site = case_when(grepl("PS", Point) ~ "Prairie Smoke NCC",
+                          grepl("NB", Point) ~ "North Bear NCC",
+                          grepl("CP", Point) ~ "Carden Alvar Prov Park")) %>%
+  mutate(Trap = substr(Point, 3, 3)) %>%
+  mutate(Week = as.numeric(substr(sp1, 5, 6))) %>%
+  #mutate(Week_2 = row_number()) %>%
+  left_join(., trap_dates %>%
+              group_by(Week) %>%
+              slice_min(Date) %>%
+              ungroup() %>%
+              select(Week, Date) %>%
+              distinct(), by = "Week") %>%
+  group_by(Point) %>%
+  nest() %>%
+  mutate(Position = map(data, ~.x %>%
+                          mutate(Ranking = ifelse(jaccard == max(jaccard), "Lowest turnover",
+                                       ifelse(jaccard == min(jaccard), "Highest turnover", "Neither"))))) %>%
+  unnest(Position) %>%
+  select(-data) %>%
+  filter(Ranking != "Neither") %>%
+  mutate(Point_2 = paste(Site, Trap, sep = " ")) %>%  
+  ggplot(aes(x = Date, y = jaccard, ymin = .lower, ymax = .upper, color = Site)) +
+  geom_pointinterval(position = "dodge") +
+  facet_grid(. ~ Ranking) +
+  scale_y_continuous("Jaccard index\n") +
+  scale_x_date("", date_breaks = "2 weeks", date_labels = "%b-%d") +
+  scale_color_viridis("", discrete = TRUE) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        strip.background = element_blank(),
+        ggh4x.facet.nestline = element_line(colour = "blue"),
+        legend.position = "bottom")
+}
+
+
+```
+
+Make all the figures
+
+```{r figures-JaccardMoths, message = FALSE, warning = FALSE}
+
+moth_jaccard_results <- moth_jaccard_all %>%
+  mutate(predictions_slopes = map2(jaccard_posteriors, Type, jaccard_slope),
+         predictions_weeks_point = map2(jaccard_posteriors, Type, jaccard_weeks),
+         predictions_weeks_average = map2(jaccard_posteriors, Type, jaccard_weeks_average),
+         predictions_dates_point = map2(jaccard_posteriors, Type, jaccard_dates))
+
+moth_jaccard_plots <- moth_jaccard_results %>%
+  mutate(weeks_point_plot = map2(predictions_weeks_point, Type, figure_weeks_point),
+         weeks_average_plot = map2(predictions_weeks_average, Type, figure_weeks_average),
+         dates_point_plot = map2(predictions_dates_point, Type, figure_dates_point))
+
+moth_jaccard_plots_2 <- moth_jaccard_plots %>% 
+  select(Type, weeks_point_plot, weeks_average_plot) %>%
+  pivot_longer(-Type, names_to = "Model", values_to = "ggs")
+
+pwalk(list(moth_jaccard_plots_2$Type, 
+      moth_jaccard_plots_2$Model,
+      moth_jaccard_plots_2$ggs),
+      function(first, second, third){
+        ggsave(paste0(first, "_", second, ".png"), 
+        third, 
+         "png",
+         width = 9,
+         height = 7,
+         units = "in")})
+```
+
+############################
+MOTH SIZE ANALYSIS
+############################
+
+Import moth size and genus data
+
+```{r importData-size, message = FALSE, warning = FALSE}
+
+moth_raw <- read_csv("moth_identificationLN.csv") %>%
+  select(Date, SP, FAMILY, SUBFAMILY, TRIBE, GENUS, SPECIES, "COUNT_#") %>%
+  rename(Point = SP, Family = FAMILY, Subfamily = SUBFAMILY, 
+         Tribe = TRIBE, Genus = GENUS, Species = SPECIES, Count = "COUNT_#") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) 
+
+## Set-up data for genus totals
+  
+moth_genus <- moth_raw %>%
+  left_join(., trap_dates %>%
+              select(Point, Date, Week) %>%
+              distinct()) %>%
+  filter(Point != "NB4") %>%
+  select(-Date) %>%
+  group_by(Genus, Week, Point) %>%
+  summarize(Count = sum(Count)) %>%
+  ungroup() %>%
+  mutate(Week_2 = rescale(Week)) %>%
+  filter(!is.na(Genus))
+
+## Data containing body lengths of all moths genera taken from Beadle and Leckie 2012
+
+moth_sizes <- read_csv("moth sizes.csv") %>%
+  pivot_longer(-Genus, names_to = "Repeats", values_to = "sizes")
+
+moth_sizes_2 <- moth_sizes %>%
+  filter(!is.na(sizes)) %>%
+  group_by(Genus) %>% 
+  summarize(Mean = mean(sizes), Min = min(sizes), Max = max(sizes), SD = abs(Min-Max)/4)
+
+moth_size_all <- left_join(moth_sizes_2, moth_genus, by = "Genus")
+
+moth_size_all <- moth_size_all %>% 
+  group_by(Point) %>%
+  mutate(Mean_overall = mean(Mean),
+         sd_overall = sd(Mean),
+         Obs = (Mean - Mean_overall)/sd_overall,
+         SD2 = SD/sd_overall) %>%
+  mutate(SD2 = ifelse(SD == 0, 0.0001, SD2)) %>%
+  ungroup()
+
+```
+
+
+Model of body size changing over time with point as a random effect
+A common smoother with each week's smoother varying in shape but with the same amount of wiggliness
+
+With 8-17 weeks, maximum wiggliness (k) should be about 5
+
+```{r model-size, message = FALSE, warning = FALSE}
+size_model <- bf(Obs | mi(SD2)  ~ s(Week_2, k = 5) + s(Week_2, Point, k = 5, bs = "fs") + 
+                   (1|Genus))
+
+```
+
+Sample priors
+
+```{r priors-size, message = FALSE, warning = FALSE}
+
+size_model_prior <- brm(size_model,
+                          data = moth_size_all,
+                          family = gaussian,
+                          prior = c(prior(normal(0, 1), class = Intercept),
+                                    prior(normal(0, 0.25), class = b), 
+                                    prior(exponential(1), class = sd),
+                                    prior(normal(0, 1), class = sds, lb = 0)),
+                          sample_prior = "only",
+                          #file = "size_prior_mean",
+                          backend = "cmdstanr")
+
+#pp_check(size_model_prior, ndraws = 100, prefix = "ppd")
+pp_check(size_model_prior, ndraws = 100, type = "stat", stat = "mean")
+#pp_check(size_model_prior, ndraws = 100, type = "stat", stat = "max")
+#pp_check(size_model_prior, ndraws = 100, type = "stat", stat = "min")
+```
+
+Sample posterior
+
+```{r posterior-size, message = FALSE, warning = FALSE}
+
+size_model_posterior <- brm(size_model,
+                            data = moth_size_all,
+                            family = gaussian,
+                            prior = c(prior(normal(0, 1), class = Intercept),
+                                      prior(normal(0, 0.25), class = b),
+                                      prior(exponential(1), class = sd),
+                                      prior(normal(0, 1), class = sds, lb = 0)),
+                            iter = 4000,
+                            warmup = 2000,
+                            chains = 4,
+                            cores = 4,
+                            control = list(adapt_delta = 0.99, max_treedepth = 15),
+                            file = "size_posterior",
+                            backend = "cmdstanr")
+
+
+pp_check(size_model_posterior, ndraws = 100)
+pp_check(size_model_posterior, ndraws = 100, type = "stat", stat = "mean")
+#pp_check(size_model_posterior, ndraws = 100, type = "stat", stat = "max")
+#pp_check(size_model_posterior, ndraws = 100, type = "stat", stat = "min")
+
+```  
+
+Predicted sizes per week, averaged over traps
+
+```{r predictions-size, message = FALSE, warning = FALSE}
+
+size_predict_avg <- avg_predictions(size_model_posterior, 
+                                      newdata = datagrid(model = size_model_posterior,
+                                                         Week_2 = unique,
+                                                         grid_type = "counterfactual"),
+                                      by = "Week_2") %>% 
+  posterior_draws()
+
+```
+
+Size change per week, averaged over season, and transformed back to original scale
+
+```{r slope-size, message = FALSE, warning = FALSE}
+
+size_slope <- size_predict_avg %>%
+  left_join(., moth_size_all %>%
+              select(Point, Week_2, Mean_overall, sd_overall) %>%
+              distinct() %>%
+              group_by(Week_2) %>%
+              summarize(Mean_overall = mean(Mean_overall, na.rm = T),
+                        sd_overall = mean(sd_overall, na.rm = T)), by = "Week_2") %>% 
+  ungroup() %>%
+  mutate(Size = sd_overall*draw + Mean_overall) %>%
+  group_by(drawid) %>%
+  mutate(Size_change = lead(Size)-Size,
+         Week_change = lead(Week_2)-Week_2,
+         Slope = (Size_change/Week_change)/22) %>%
+  ungroup() %>%
+  filter(!is.na(Slope)) %>%
+  median_qi(Slope, .width = c(0.5, 0.95))
+
+```
+
+Size per week, averaged over season, and transformed back to original scale
+
+```{r sizes-size, message = FALSE, warning = FALSE}
+
+  size_predictions_avg <- size_predict_avg %>%
+    left_join(., moth_size_all %>%
+                select(Point, Week_2, Mean_overall, sd_overall) %>%
+                distinct() %>%
+                group_by(Week_2) %>%
+                summarize(Mean_overall = mean(Mean_overall, na.rm = T),
+                          sd_overall = mean(sd_overall, na.rm = T)), by = "Week_2") %>%
+    ungroup() %>%
+    mutate(Size = sd_overall*draw + Mean_overall) %>%
+    group_by(Week_2) %>%
+    median_qi(Size, .width = c(0.5, 0.95))
+```
+
+Figure of average moth body size each week
+- Figure 6
+
+```{r figure-size, message = FALSE, warning = FALSE}
+
+size_avg_figure <- size_predictions_avg  %>%
+  left_join(., moth_size_all %>%
+               select(Week, Week_2) %>%
+              distinct(), by = "Week_2") %>%
+  left_join(., trap_dates %>%
+              group_by(Week) %>%
+              slice_min(Date) %>%
+              ungroup() %>%
+              select(Week, Date) %>%
+              distinct(), by = "Week") %>%
+    ggplot(aes(x = Date, y = Size, ymin = .lower, ymax = .upper)) +
+    geom_pointrange(data = moth_size_all %>%
+                 left_join(., trap_dates %>%
+                             group_by(Week) %>%
+                             slice_min(Date) %>%
+                             ungroup() %>%
+                             select(Week, Date) %>%
+                             distinct(), by = "Week") %>%
+                 mutate(Site = case_when(grepl("PS", Point) ~ "Prairie Smoke NCC",
+                                         grepl("NB", Point) ~ "North Bear NCC",
+                                         grepl("CP", Point) ~ "Carden Alvar Prov Park")) %>%
+                 mutate(Trap = substr(Point, 3, 3)) %>%
+                 mutate(Size = Mean) %>%
+                 mutate(.lower = Mean - SD, .upper = Mean + SD),
+                 aes(x = Date, y = Size, ymin = .lower, ymax = .upper, color = Site)) + 
+  geom_ribbon(alpha = 0.7, linewidth = 0.5) +
+  geom_line() +
+  scale_y_continuous("Body length (mm)\n") +
+  scale_x_date("", date_breaks = "2 weeks", date_labels = "%b-%d") +
+  scale_color_viridis("", discrete = TRUE) +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+ggsave("size_average_mi.png", device = "png",
+       width = 9,
+       height = 7,
+       units = "in")
+
+```
+
+Figure of average moth body size each week for each trap
+- Figure S7
+
+```{r figure-traps-size, message = FALSE, warning = FALSE}
+
+size_predict<- avg_predictions(size_model_posterior, 
+                                  newdata = datagrid(model = size_model_posterior, 
+                                                     Week_2 = unique, 
+                                                     grid_type = "counterfactual"),
+                                  by = c("Point", "Week_2")) %>% 
+  posterior_draws() %>%
+  left_join(., moth_size_all %>%
+              select(Point, Week_2, Mean_overall, sd_overall) %>%
+              distinct(), by = c("Point", "Week_2")) %>% 
+  group_by(Point) %>%
+  fill(c("Mean_overall", sd_overall), .direction = 'updown') %>%
+  ungroup() %>%
+  mutate(Size = sd_overall*draw + Mean_overall)
+
+size_predict_point <- size_predict %>%
+  group_by(Point, Week_2) %>%
+  median_qi(Size, .width = c(0.5, 0.95))
+
+size_predict_figure <- size_predict_point %>%
+  left_join(., moth_size_all %>%
+              select(Week, Week_2) %>%
+              distinct(), by = "Week_2") %>%
+  left_join(., trap_dates %>%
+              group_by(Week) %>%
+              slice_min(Date) %>%
+              ungroup() %>%
+              select(Week, Date) %>%
+              distinct(), by = "Week") %>%
+    mutate(Site = case_when(grepl("PS", Point) ~ "Prairie Smoke NCC",
+                            grepl("NB", Point) ~ "North Bear NCC",
+                            grepl("CP", Point) ~ "Carden Alvar Prov Park")) %>%
+    mutate(Trap = substr(Point, 3, 3)) %>%
+  mutate(Date_2 = case_when(Date == "2023-05-06" ~ "06-May",
+                            Date == "2023-07-05" ~ "05-Jul",
+                            Date == "2023-10-04" ~ "04-Oct")) %>%
+  filter(Week_2 %in% c(min(Week_2), median(Week_2), max(Week_2))) %>%
+  ggplot(aes(x = fct_rev(Date_2),  y = Size, ymin = .lower, ymax = .upper, color = Point)) +
+  geom_pointinterval() +
+  facet_nested(. ~ Site + Trap, nest_line = element_line(linetype = 2)) +
+  scale_y_continuous("Body length (mm)\n") +
+  scale_x_discrete("") +
+  #scale_x_date("", breaks = Date)+#labels = c("6-May", "5-Jul", "4-Oct")) +
+  scale_color_viridis("", discrete = TRUE) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        strip.background = element_blank(),
+        ggh4x.facet.nestline = element_line(colour = "blue"),
+        legend.position = "none")
+
+ggsave("size_by_point_mi.png", 
+       device = "png",
+       width = 9,
+       height = 7,
+       units = "in")
+```
+
+Calculate difference between largest and smallest moths per trap
+
+```{r difference-traps-size, message = FALSE, warning = FALSE}
+
+size_compare <- size_predict %>%
+  group_by(Point) %>% 
+  mutate(Keep = ifelse(estimate == min(estimate), "Min", 
+                       ifelse(estimate == max(estimate), "Max", "No"))) %>%
+  filter(Keep != "No") %>%
+  select(drawid, Point, Size, Keep) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(drawid, Point), names_from = Keep, values_from = Size) %>%
+  mutate(Difference = Max - Min) %>%
+  group_by(Point) %>%
+  median_qi(Difference, .width = c(0.5, 0.95))
+  
+```

@@ -1,0 +1,49 @@
+Trap,Type,Distance_edge,Distance_between,Species
+CP2,Alvar,13.28,,Ulmus americana
+CP2,Edge,3.36,,Lonicera morrowii
+CP2,Moth,8.8,260.86,
+CP3,Alvar,42.3,,Populus tremuloides
+CP3,Edge,32.28,,Populus tremuloides
+CP3,Moth,33.44,260.86,
+CP4,Alvar,34.5,,Crataegus chrysocarpa
+CP4,Edge,6.55,,Populus tremuloides
+CP4,Moth,10.04,267.28,
+CP5,Alvar,35.43,,Lonicera tatarica
+CP5,Edge,3.95,,Crataegus chrysocarpa
+CP5,Moth,7.01,267.28,
+CP6,Alvar,55.75,,Salix bebbiana
+CP6,Edge,17.19,,Populus tremuloides
+CP6,Moth,12.43,278.52,
+CP7,Alvar,50.43,,Prunus virginiana
+CP7,Edge,0,,Lonicera morrowii
+CP7,Moth,3.5,278.52,
+NB1,Alvar,227.57,,Crataegus chrysocarpa
+NB1,Edge,156.16,,Prunus serotina
+NB1,Moth,175.66,231.59,
+NB2,Alvar,60.76,,Prunus virginiana
+NB2,Edge,84.74,,Prunus virginiana
+NB2,Moth,55.97,237.86,
+NB3,Alvar,31.45,,Acer rubrum
+NB3,Edge,0,,Prunus virginiana
+NB3,Moth,26.63,237.86,
+NB4,Alvar,25.57,,Prunus sp.
+NB4,Edge,25.85,,Prunus sp.
+NB4,Moth,18.3,,
+NB5,Alvar,38.7,,Prunus virginiana
+NB5,Edge,11.32,,Prunus serotina
+NB5,Moth,12.02,1112.93,
+PS1,Alvar,16.15,,Populus balsamifera
+PS1,Edge,4.18,,Populus tremuloides
+PS1,Moth,4.18,297.02,
+PS2,Alvar,16.01,,Spiraea alba
+PS2,Edge,3.7,,Populus balsamifera
+PS2,Moth,3.15,342.85,
+PS3,Alvar,5.29,,Prunus virginiana
+PS3,Edge,0,,Crataegus chrysocarpa
+PS3,Moth,5.29,250.09,
+PS4,Alvar,23.78,,Spiraea alba
+PS4,Edge,22.48,,Populus tremuloides
+PS4,Moth,23.78,245.61,
+PS5,Alvar,16.74,,Ulmus americana
+PS5,Edge,0,,Populus tremuloides
+PS5,Moth,16.74,245.61,
